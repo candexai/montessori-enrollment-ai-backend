@@ -37,7 +37,7 @@ function getCartesiaDefaultModel() {
 }
 
 function getCartesiaDefaultVoiceId() {
-    return process.env.CARTESIA_DEFAULT_VOICE_ID?.trim() || '95d51f79-c397-46f9-b49a-23763d3eaa2d';
+    return process.env.CARTESIA_DEFAULT_VOICE_ID?.trim() || 'db6b0ed5-d5d3-463d-ae85-518a07d3c2b4';
 }
 
 function getPostCallWebhookUrl() {
