@@ -2,7 +2,7 @@ const crypto = require('crypto');
 const LeadInsight = require('../models/LeadInsight');
 const { extractTourDetails, mergeParentQuestionsFromExtraction, filterSchoolQuestions } = require('../utils/openai');
 const { getCallerPhoneFromWebhook, getCallDurationSeconds, getCallerNameFromWebhook, isUsableCallerName, isRealPhoneForLookup, isWidgetCallerId } = require('../utils/webhookHelpers');
-const { resolveWebhookSummary, resolveCachedSummary, isNoMeaningfulInteractionSummary, isCurrentFamilyCall, callerIdentifiedAsCurrentFamily, callerIdentifiedAsNewFamily, callerWantsHumanRoutingOnly, callerIdentifiedAsNewFamilyFromTranscript, callerWantsHumanRoutingOnlyFromTranscript } = require('../utils/currentFamilyTransfer');
+const { resolveWebhookSummary, resolveCachedSummary, isNoMeaningfulInteractionSummary, isCurrentFamilyCall, callerIdentifiedAsCurrentFamily, callerIdentifiedAsNewFamily, callerWantsHumanRoutingOnly, callerIdentifiedAsNewFamilyFromTranscript, callerWantsHumanRoutingOnlyFromTranscript, agentConfirmedCurrentFamily, callerIsNonParent, callerIsNonParentFromTranscript } = require('../utils/currentFamilyTransfer');
 
 const PAST_CALL_NAME_TAG = 'Past call name used';
 
@@ -176,24 +176,27 @@ function resolveCallerNameWithPastFallback(index, {
 const NEW_PARENT_INTENT_PATTERNS = [
     /\benroll(?:ment|ing)?\b/i,
     /\badmission\b/i,
-    /\btour\b/i,
-    /\bvisit(?:ing)?\b|\bschedule\b|\bbook(?:ing)?\b/i,
+    /\btour(?:ing|s)?\b/i,
+    /\bvisit(?:ing)?\b|\bschedule\b|\bbook(?:ing)?\b|\blook(?:ing)? around\b/i,
     /tuition|price|cost|fee|afford|financial aid/i,
     /callback|call (?:me )?back|speak (?:to|with) (?:someone|staff|a person)/i,
     /urgent|as soon as possible|starting (?:next week|soon)/i,
     /program|curriculum|classroom|hours|pickup|drop.?off|meal|food|ratio|teacher|camera|security|summer camp|after.?school/i,
+    /daycare|childcare|child care|preschool|pre.?k\b/i,
+    /moving to (?:the )?area|new to (?:the )?area/i,
 ];
 
 /** Current-family calls only count as hot when they ask about something substantive. */
 const CURRENT_FAMILY_INQUIRY_PATTERNS = [
-    /tuition|price|cost|fee|billing|payment|invoice/i,
-    /hours|schedule|pickup|drop.?off|holiday|closure|\bopen\b|\bclose\b/i,
+    /tuition|price|cost|fee|billing|payment|invoice|financial aid|sibling discount|military discount/i,
+    /hours|schedule|pickup|drop.?off|holiday|closure|\bopen\b|\bclose\b|part.?time|extended (?:hours|care)/i,
     /meal|food|allerg|lunch|snack/i,
-    /teacher|ratio|classroom|director|staff/i,
+    /teacher|ratio|classroom|director|staff|curriculum|montessori|stem/i,
     /camera|security|safety|incident/i,
     /bus|transportation|field trip/i,
-    /summer camp|after.?school|extended care/i,
+    /summer camp|after.?school/i,
     /sick|absence|attendance/i,
+    /waitlist|potty training|\bnap\b/i,
 ];
 
 function hashTranscript(transcriptText) {
@@ -545,7 +548,7 @@ const STRONG_ENROLLMENT_URGENCY = new Set(['immediate', 'within weeks', 'specifi
 
 // Near-term / urgent enrollment target phrasing (a concrete soon-ish intent). Deliberately
 // excludes far-future intent like "next year" / "in the fall of next year" so those stay warm.
-const NEAR_TERM_TARGET_PATTERN = /\b(asap|as soon as possible|immediate(?:ly)?|right away|this (?:week|month)|next (?:week|month)|within (?:a |the |the next )?(?:week|month|weeks|few weeks|couple (?:of )?weeks)|january|february|march|april|may|june|july|august|september|october|november|december)\b/i;
+const NEAR_TERM_TARGET_PATTERN = /\b(asap|as soon as possible|immediate(?:ly)?|right away|this (?:week|month)|next (?:week|month)|within (?:a |the |the next )?(?:week|month|weeks|few weeks|couple (?:of )?weeks)|before (?:the )?school year|by (?:the )?fall|start of (?:the )?semester|january|february|march|april|may|june|july|august|september|october|november|december)\b/i;
 
 // Explicit enrollment intent the parent voices (scanned against parent-sourced text only).
 const ENROLLMENT_INTENT_PATTERNS = [
@@ -559,18 +562,26 @@ const ENROLLMENT_INTENT_PATTERNS = [
     /\b(?:do you have|is there|are there)\b.{0,25}\b(?:spot|space|opening|slot|availab|room|capacity|waitlist)\b/i,
     /\blooking (?:for|to|at)\b.{0,30}\b(?:care|daycare|childcare|preschool|enroll|program|school|spot|placement)\b/i,
     /\b(?:need|want|interested in|hoping)\b.{0,30}\b(?:enroll|daycare|childcare|care for|preschool|a spot|placement|start)\b/i,
-    /\bstart(?:ing)?\b.{0,20}\b(?:school|daycare|program|care|next)\b/i,
+    /\bstart(?:s|ing)?\b.{0,20}\b(?:school|daycare|program|care|next)\b/i,
     /\bplace for (?:my|our)\b/i,
+    /\bmoving to (?:the )?area\b.{0,40}\bneed\b/i,
+    /\bfirst time\b.{0,20}\b(?:daycare|preschool|childcare)\b/i,
+    /\bswitch(?:ing)? (?:daycares?|schools?|preschools?)\b/i,
+    /\bwant(?:s)? (?:him|her|them|my (?:son|daughter|kids?)) to (?:go|attend|start)\b/i,
 ];
 
 // Tour interest the parent voices (booked, requested, or wants to visit/see the school).
 const TOUR_INTENT_PATTERNS = [
-    /\btour\b/i,
+    /\btour(?:ing|s)?\b/i,
+    /\blook(?:ing)? around\b/i,
     /\b(?:come|schedule|book|set up|arrange|plan)\b.{0,20}\b(?:visit|tour|see|look)\b/i,
     /\bvisit (?:the )?(?:school|center|centre|facility|campus|place|daycare)\b/i,
     /\bsee (?:the )?(?:school|classroom|facility|place|center|centre)\b/i,
     /\bcome (?:in|by|and see|take a look|check)\b/i,
     /\bwalk[\s-]?(?:in|through)\b/i,
+    /\bopen house\b/i,
+    /\bdrop.?in\b.{0,15}\bvisit\b/i,
+    /\bwhen can (?:i|we) come\b/i,
 ];
 
 /**
@@ -593,7 +604,11 @@ function hasStrongEnrollmentIntent({ comprehensiveResult = null, tags = [], tour
 
     const tagHaystack = (Array.isArray(tags) ? tags : []).join(' ').toLowerCase();
     if (/urgency:\s*(?:immediate|high)/i.test(tagHaystack)) return true;
-    if (/\btour (?:requested|booked)\b/i.test(tagHaystack)) return true;
+    // "Tour booked" corroborates a confirmed booking (redundant with the tourBooked check
+    // above, kept for cached-tag-only call sites). "Tour requested" is deliberately excluded —
+    // the extractor tags it for ANY expressed visit interest, including soft ones ("when can I
+    // come by sometime"), so it must not bypass the warm tier on its own.
+    if (/\btour booked\b/i.test(tagHaystack)) return true;
 
     return false;
 }
@@ -614,18 +629,23 @@ function hasEnrollmentOrTourIntent({ callerText = '', questionsAsked = [], compr
     return false;
 }
 
+function llmFlaggedHotLead(tags) {
+    return (Array.isArray(tags) ? tags : []).some((t) => String(t).trim().toLowerCase() === 'hot lead');
+}
+
 /**
- * HOT LEAD = a genuinely interested caller worth prioritizing. For a prospective (new) family
- * this fires on ANY real buying signal:
- *   1. A school/knowledge-base question (tuition, hours, meals, ratio, curriculum, safety,
- *      availability/waitlist, age groups, etc.)
- *   2. A tour — booked, requested, or an expressed wish to visit/see the school
- *   3. Enrollment intent — wants to enroll/register/sign up, asks about a spot/opening, or a
- *      concrete near-term timeframe (immediate / within weeks / specific month / a named date)
- * A current family is hot only when it raises a substantive service question. Empty, no-interaction,
- * unknown, and non-parent (teacher/vendor/employment) calls are never hot.
+ * LEAD TEMPERATURE — hot / warm / cold. For a prospective (new) family:
+ *   HOT: a tour booked, strong enrollment urgency/near-term date, or TWO independent buying
+ *        signals together (a school/KB question AND enrollment/tour intent) — or one signal
+ *        the LLM's own extraction also independently flagged as hot.
+ *   WARM: exactly one buying signal alone (a KB question, or soft enrollment/tour intent) with
+ *        nothing else corroborating it — genuine interest, but not yet a strong signal.
+ *   COLD: no meaningful interaction, unknown segment, or no buying signal at all.
+ * A current family is hot only when it raises a substantive service question (see
+ * CURRENT_FAMILY_INQUIRY_PATTERNS), warm when it engages but not substantively, and cold
+ * otherwise. Non-parent (teacher/vendor/employment) calls are always cold via parentSegment.
  */
-function detectHotLead({
+function classifyLeadTemperature({
     tags = [],
     summary = '',
     callerText = '',
@@ -638,28 +658,38 @@ function detectHotLead({
     const summaryText = String(summary || '').toLowerCase();
 
     if (/no meaningful interaction|did not engage|call was interrupted|caller did not/i.test(summaryText)) {
-        return false;
+        return 'cold';
     }
 
     if (parentSegment === 'unknown') {
-        return false;
+        return 'cold';
     }
 
     const schoolInquiry = hasSchoolKbInquiry({ questionsAsked, callerText, comprehensiveResult });
 
-    // Current families are hot only when they raise a substantive service question.
+    // Current families: hot only with a substantive service question, warm with lighter engagement.
     if (parentSegment === 'current_family') {
-        if (!schoolInquiry) return false;
+        if (!schoolInquiry) return 'cold';
         const inquiryHaystack = `${callerText} ${filterSchoolQuestions(questionsAsked).join(' ')}`.trim();
-        return CURRENT_FAMILY_INQUIRY_PATTERNS.some((pattern) => pattern.test(inquiryHaystack));
+        return CURRENT_FAMILY_INQUIRY_PATTERNS.some((pattern) => pattern.test(inquiryHaystack)) ? 'hot' : 'warm';
     }
 
-    // Prospective (new) families: hot on any real buying signal.
-    if (schoolInquiry) return true;
-    if (hasStrongEnrollmentIntent({ comprehensiveResult, tags, tourBooked })) return true;
-    if (hasEnrollmentOrTourIntent({ callerText, questionsAsked, comprehensiveResult })) return true;
+    // Prospective (new) families.
+    const strongIntent = hasStrongEnrollmentIntent({ comprehensiveResult, tags, tourBooked });
+    const softIntent = hasEnrollmentOrTourIntent({ callerText, questionsAsked, comprehensiveResult });
+    const llmFlaggedHot = llmFlaggedHotLead(tags) && comprehensiveResult?.call_state !== 'no_interaction';
 
-    return false;
+    if (tourBooked || strongIntent) return 'hot';
+    if (schoolInquiry && softIntent) return 'hot';
+    if (schoolInquiry || softIntent) return llmFlaggedHot ? 'hot' : 'warm';
+    if (llmFlaggedHot) return 'warm';
+
+    return 'cold';
+}
+
+/** Backward-compat wrapper — several call sites/scripts still consume a plain boolean. */
+function detectHotLead(args) {
+    return classifyLeadTemperature(args) === 'hot';
 }
 
 function agentTriggeredCurrentFamilyTransfer(agentText) {
@@ -777,6 +807,16 @@ function detectParentSegment(tags, summary, webhookOrCallerText, options = {}) {
         ?? (typeof webhookOrCallerText === 'object' ? webhookOrCallerText?.comprehensive_result : null)
         ?? null;
 
+    // Non-parent callers (teacher/vendor/employment/wrong number) are never a lead of any
+    // kind — keep them out of new_parent/current_family entirely so they can't surface as
+    // hot/warm leads just because they happened to mention tuition or hours.
+    if (webhook?.transcript && callerIsNonParentFromTranscript(webhook.transcript)) {
+        return 'unknown';
+    }
+    if (callerIsNonParent(callerText)) {
+        return 'unknown';
+    }
+
     // Current family: transcript proof, OR the extractor's guarded "Current Family" tag.
     if (webhook?.transcript && isCurrentFamilyCall(webhook.transcript)) {
         return 'current_family';
@@ -807,19 +847,34 @@ function detectParentSegment(tags, summary, webhookOrCallerText, options = {}) {
         return 'new_parent';
     }
 
-    // Parents who only ask for a representative/director/front desk (never said "new family").
-    if (webhook?.transcript && callerWantsHumanRoutingOnlyFromTranscript(webhook.transcript)) {
-        return 'current_family';
-    }
-    if (callerWantsHumanRoutingOnly(callerText)) {
-        return 'current_family';
-    }
-
     const questionsAsked = options.questionsAsked || [];
     const childName = options.childName || '';
     const childAge = options.childAge || '';
     const tourBooked = options.tourBooked
         ?? (webhook ? isTourBooked(webhook, comprehensiveResult) : false);
+
+    // Parents who only ask for a representative/director/front desk (never said "new family").
+    // Do NOT assume current_family purely from routing language — new parents ask for "someone"
+    // too. Trust it only when Nora's own reply corroborates current-family status; otherwise fall
+    // back to any real new-parent evidence, and only land on current_family as a last resort when
+    // there is truly nothing else to go on (still surfaced as unknown for staff review, not
+    // silently mislabeled).
+    const wantsRoutingOnly = (webhook?.transcript && callerWantsHumanRoutingOnlyFromTranscript(webhook.transcript))
+        || callerWantsHumanRoutingOnly(callerText);
+    if (wantsRoutingOnly) {
+        const agentText = webhook ? getAgentText(webhook) : '';
+        if (agentConfirmedCurrentFamily(agentText)) {
+            return 'current_family';
+        }
+        const hasNewParentEvidence =
+            hasSchoolRelatedIntent({ summary, callerText, questionsAsked, comprehensiveResult, tags })
+            || hasCapturedEnrollmentData({ childName, childAge, comprehensiveResult })
+            || tourBooked;
+        if (hasNewParentEvidence) {
+            return 'new_parent';
+        }
+        return 'unknown';
+    }
 
     if (isUnknownCall({
         tags,
@@ -837,13 +892,15 @@ function detectParentSegment(tags, summary, webhookOrCallerText, options = {}) {
     return 'new_parent';
 }
 
-function enrichTags(tags, isHotLead, parentSegment) {
+function enrichTags(tags, leadTemperature, parentSegment) {
     let next = dedupeTags(Array.isArray(tags) ? tags : []);
     const hasTag = (label) => next.some((tag) => tag.toLowerCase() === label.toLowerCase());
 
-    next = next.filter((tag) => tag.toLowerCase() !== 'hot lead');
-    if (isHotLead && !hasTag('Hot Lead')) {
+    next = next.filter((tag) => tag.toLowerCase() !== 'hot lead' && tag.toLowerCase() !== 'warm lead');
+    if (leadTemperature === 'hot' && !hasTag('Hot Lead')) {
         next.unshift('Hot Lead');
+    } else if (leadTemperature === 'warm' && !hasTag('Warm Lead')) {
+        next.unshift('Warm Lead');
     }
 
     if (parentSegment === 'current_family' && !hasTag('Current Family')) {
@@ -893,8 +950,11 @@ function applyTagPostProcessing(comprehensiveData) {
     });
 
     data.tags = dedupeTags(data.tags);
-    if (!data.isHotLead) {
+    if (data.leadTemperature !== 'hot') {
         data.tags = data.tags.filter((tag) => tag.toLowerCase() !== 'hot lead');
+    }
+    if (data.leadTemperature !== 'warm') {
+        data.tags = data.tags.filter((tag) => tag.toLowerCase() !== 'warm lead');
     }
 
     return data;
@@ -928,7 +988,7 @@ function mapInsightFields(webhook, { tags = [], comprehensiveResult = null, summ
         tourBooked,
     });
 
-    const isHotLead = detectHotLead({
+    const leadTemperature = classifyLeadTemperature({
         tags,
         summary: resolvedSummary,
         callerText,
@@ -938,15 +998,17 @@ function mapInsightFields(webhook, { tags = [], comprehensiveResult = null, summ
         comprehensiveResult,
         tourBooked,
     });
+    const isHotLead = leadTemperature === 'hot';
 
     return applyTagPostProcessing({
-        tags: enrichTags(tags, isHotLead, parentSegment),
+        tags: enrichTags(tags, leadTemperature, parentSegment),
         childName,
         childAge,
         language: comprehensiveResult?.language_spoken || webhook?.extractedLanguage || '',
         missingDetails,
         questionsAsked,
         isHotLead,
+        leadTemperature,
         parentSegment,
         tourBooked,
         parentEmail,
@@ -992,7 +1054,7 @@ function sanitizeCachedInsight(doc, webhook = null) {
 
     const questionsAsked = doc.questionsAsked || [];
     const missingDetails = doc.missingDetails || [];
-    const isHotLead = detectHotLead({
+    const leadTemperature = classifyLeadTemperature({
         tags,
         summary: doc.summary || '',
         callerText: webhook ? getCallerText(webhook) : '',
@@ -1002,9 +1064,11 @@ function sanitizeCachedInsight(doc, webhook = null) {
         comprehensiveResult: webhook?.comprehensive_result || null,
         tourBooked: doc.tourBooked ?? (webhook ? isTourBooked(webhook, webhook?.comprehensive_result) : false),
     });
+    const isHotLead = leadTemperature === 'hot';
     return {
-        tags: enrichTags(tags.filter((t) => t.toLowerCase() !== 'hot lead'), isHotLead, parentSegment),
+        tags: enrichTags(tags.filter((t) => t.toLowerCase() !== 'hot lead' && t.toLowerCase() !== 'warm lead'), leadTemperature, parentSegment),
         isHotLead,
+        leadTemperature,
         parentSegment,
     };
 }
@@ -1020,6 +1084,7 @@ function mapLeadInsightDoc(doc, webhook = null) {
         missingDetails: doc.missingDetails || [],
         questionsAsked: doc.questionsAsked || [],
         isHotLead: sanitized.isHotLead,
+        leadTemperature: sanitized.leadTemperature,
         parentSegment: sanitized.parentSegment,
         aiProcessed: Boolean(doc.aiProcessed),
     };
@@ -1059,6 +1124,7 @@ function buildLeadInsightPersistPayload(schoolId, webhook, insightData, transcri
         missingDetails: insightData.missingDetails || [],
         questionsAsked: insightData.questionsAsked || [],
         isHotLead: Boolean(insightData.isHotLead),
+        leadTemperature: insightData.leadTemperature || 'cold',
         parentSegment: insightData.parentSegment || 'new_parent',
         processedAt: new Date(),
         ...snapshot,
@@ -1110,7 +1176,7 @@ async function buildInsightDataForWebhook(webhook, { allowOpenAI = false } = {})
             const questionsAsked = mergeParentQuestionsFromExtraction(extracted, {
                 summaryText: webhook?.summary || '',
             });
-            const isHotLead = detectHotLead({
+            const leadTemperature = classifyLeadTemperature({
                 tags: extracted.tags || [],
                 summary: webhook?.summary,
                 callerText,
@@ -1119,11 +1185,13 @@ async function buildInsightDataForWebhook(webhook, { allowOpenAI = false } = {})
                 missingDetails: extracted.missingDetails || [],
                 comprehensiveResult: extracted,
             });
+            const isHotLead = leadTemperature === 'hot';
             const data = applyTagPostProcessing({
                 ...extracted,
                 questionsAsked,
-                tags: enrichTags(extracted.tags || [], isHotLead, parentSegment),
+                tags: enrichTags(extracted.tags || [], leadTemperature, parentSegment),
                 isHotLead,
+                leadTemperature,
                 parentSegment,
             });
             return { ...data, transcriptHash };
@@ -1255,6 +1323,7 @@ function buildActionNeededCallFromInsight(row, backendUrl, userToken, webhook = 
         language: row.language || '',
         missingDetails: row.missingDetails || [],
         isHotLead: sanitized.isHotLead,
+        leadTemperature: sanitized.leadTemperature,
         parentSegment: sanitized.parentSegment,
         aiProcessed: Boolean(row.aiProcessed ?? true),
     };
@@ -1267,7 +1336,7 @@ async function loadActionNeededCalls(schoolObjectId, backendUrl, userToken, opti
         'webhookId', 'conversationId', 'callerName', 'callerPhone', 'summary',
         'callTimestamp', 'durationSeconds', 'actionNeededEligible', 'actionTakenFeedback',
         'actionTakenAt', 'questionsAsked', 'tags', 'childName', 'childAge', 'language',
-        'missingDetails', 'isHotLead', 'parentSegment', 'aiProcessed', 'processedAt',
+        'missingDetails', 'isHotLead', 'leadTemperature', 'parentSegment', 'aiProcessed', 'processedAt',
     ].join(' ');
 
     const phoneKey = (phone) => {
@@ -1514,6 +1583,7 @@ function buildActionNeededCall(webhook, insight, backendUrl, userToken) {
         language: data.language || '',
         missingDetails: data.missingDetails || [],
         isHotLead: Boolean(data.isHotLead),
+        leadTemperature: data.leadTemperature || 'cold',
         parentSegment: data.parentSegment || 'new_parent',
         aiProcessed: Boolean(data.aiProcessed ?? true),
     };
@@ -1526,6 +1596,7 @@ module.exports = {
     hashTranscript,
     getTranscriptText,
     detectHotLead,
+    classifyLeadTemperature,
     detectParentSegment,
     enrichTags,
     resolveParentEmail,

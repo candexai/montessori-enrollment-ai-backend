@@ -20,12 +20,10 @@ const CouponRedemption = require('../models/CouponRedemption');
 const { authMiddleware, adminOnly } = require('../middleware/auth');
 const { getCallerNameFromWebhook, getCallerPhoneFromWebhook } = require('../utils/webhookHelpers');
 const {
-    importSipTrunk,
-    deletePhoneNumber,
-    updatePhoneNumber,
-    patchAgentPromptContent,
+    getProvider,
+    getActiveProviderName,
     HUMAN_TRANSFER_TOOL_CONDITION,
-} = require('../utils/elevenlabs');
+} = require('../services/voiceProviders');
 const { aiNumberAssignmentPatch, normalizeAiDigits } = require('../utils/aiNumberOwnership');
 const AlertService = require('../services/alertService');
 
@@ -953,22 +951,23 @@ router.post('/phone-numbers', async (req, res) => {
     try {
         const payload = req.body;
         console.log('[Admin Phone Import] Request Body:', JSON.stringify(payload, null, 2));
-        let result;
+        const providerName = getActiveProviderName();
 
-        console.log(`[Admin Phone] Importing SIP Trunk: ${payload.phone_number}`);
-        result = await importSipTrunk(payload);
+        console.log(`[Admin Phone] Importing SIP Trunk via ${providerName}: ${payload.phone_number}`);
+        const result = await getProvider(providerName).importSipTrunk(payload);
 
         if (!result || !result.phone_number_id) {
             if (result?.alreadyExists) {
-                return res.status(409).json({ error: 'This phone number is already imported in ElevenLabs.' });
+                return res.status(409).json({ error: `This phone number is already imported in ${providerName}.` });
             }
-            return res.status(500).json({ error: 'Failed to retrieve phone_number_id from ElevenLabs API' });
+            return res.status(500).json({ error: `Failed to retrieve phone_number_id from ${providerName} API` });
         }
 
         const newNum = await PhoneNumber.create({
             phone_number_id: result.phone_number_id,
             phone_number: payload.phone_number,
             provider: 'sip_trunk',
+            voiceProvider: providerName,
             label: payload.label || 'Imported Number',
         });
 
@@ -986,11 +985,11 @@ router.delete('/phone-numbers/:id', async (req, res) => {
         const numDoc = await PhoneNumber.findById(id);
         if (!numDoc) return res.status(404).json({ error: 'Number not found' });
 
-        // 1. Delete from ElevenLabs
+        // 1. Delete from the voice provider this number was imported into
         try {
-            await deletePhoneNumber(numDoc.phone_number_id);
+            await getProvider(numDoc.voiceProvider || 'elevenlabs').deletePhoneNumber(numDoc.phone_number_id);
         } catch (err) {
-            console.warn(`[Admin Phone Delete] Failed to delete from ElevenLabs:`, err.message);
+            console.warn(`[Admin Phone Delete] Failed to delete from ${numDoc.voiceProvider || 'elevenlabs'}:`, err.message);
         }
 
         // 2. If assigned to a school, clear it there too
@@ -1031,11 +1030,12 @@ router.post('/schools/:id/assign-number', async (req, res) => {
 
             console.log(`[Unassign Phone] Removing number ${currentPhoneId} from school ${school.name}...`);
 
-            // 1. Reconcile with ElevenLabs (remove agent association)
+            // 1. Reconcile with the voice provider that owns this number (remove agent association)
+            const currentPhoneDoc = await PhoneNumber.findOne({ phone_number_id: currentPhoneId }).select('voiceProvider').lean();
             try {
-                await updatePhoneNumber(currentPhoneId, { agent_id: null });
+                await getProvider(currentPhoneDoc?.voiceProvider || 'elevenlabs').updatePhoneNumber(currentPhoneId, { agent_id: null });
             } catch (elError) {
-                console.warn(`[Unassign Phone] ElevenLabs dissociation warning (ignoring):`, elError.message);
+                console.warn(`[Unassign Phone] Voice provider dissociation warning (ignoring):`, elError.message);
             }
 
             // 2. Clear PhoneNumber record association
@@ -1070,11 +1070,21 @@ router.post('/schools/:id/assign-number', async (req, res) => {
             return res.status(400).json({ error: 'This number is already assigned to another school' });
         }
 
+        // A number imported for one voice provider can't be routed to an agent on another provider.
+        const numberProvider = phoneNum.voiceProvider || 'elevenlabs';
+        const schoolProvider = school.voiceProvider || 'elevenlabs';
+        if (school.elevenlabsAgentId && numberProvider !== schoolProvider) {
+            return res.status(400).json({
+                error: `This phone number was imported for ${numberProvider}, but this school's agent runs on ${schoolProvider}. Import a number for ${schoolProvider} instead.`,
+            });
+        }
+
         // 1. Cleanup: If the school has a DIFFERENT number assigned, unassign it first
         if (school.agentPhoneNumberId && school.agentPhoneNumberId !== phoneNum.phone_number_id) {
             console.log(`[Assign Phone] Cleaning up old assignment for school: ${school.agentPhoneNumberId}`);
+            const oldPhoneDoc = await PhoneNumber.findOne({ phone_number_id: school.agentPhoneNumberId }).select('voiceProvider').lean();
             try {
-                await updatePhoneNumber(school.agentPhoneNumberId, { agent_id: null });
+                await getProvider(oldPhoneDoc?.voiceProvider || 'elevenlabs').updatePhoneNumber(school.agentPhoneNumberId, { agent_id: null });
             } catch (err) {
                 console.warn(`[Assign Phone] Old dissociation warning:`, err.message);
             }
@@ -1094,32 +1104,32 @@ router.post('/schools/:id/assign-number', async (req, res) => {
         }
         await school.save();
 
-        // 3. Reconcile with ElevenLabs
+        // 3. Reconcile with the voice provider this number belongs to
         if (school.elevenlabsAgentId) {
-            console.log(`[Assign Phone] Linking Agent ${school.elevenlabsAgentId} to Number ${phoneNum.phone_number_id}...`);
+            console.log(`[Assign Phone] Linking Agent ${school.elevenlabsAgentId} to Number ${phoneNum.phone_number_id} via ${numberProvider}...`);
             try {
-                const elResult = await updatePhoneNumber(phoneNum.phone_number_id, {
+                await getProvider(numberProvider).updatePhoneNumber(phoneNum.phone_number_id, {
                     agent_id: school.elevenlabsAgentId
                 });
-                console.log(`[Assign Phone] ElevenLabs Reconcile Success`);
+                console.log(`[Assign Phone] Voice provider reconcile success`);
             } catch (elError) {
-                console.error(`[Assign Phone] ElevenLabs link failed:`, elError.message);
+                console.error(`[Assign Phone] Voice provider link failed:`, elError.message);
                 AlertService.create({
                     type: 'AGENT_ERROR',
                     severity: 'CRITICAL',
                     schoolId: school._id,
                     schoolName: school.name,
-                    title: 'ElevenLabs phone link failed',
+                    title: 'Voice provider phone link failed',
                     message: elError.message,
                     source: 'admin.assign-number',
-                    metadata: { agentId: school.elevenlabsAgentId, phoneNumberId: phoneNum.phone_number_id },
+                    metadata: { provider: numberProvider, agentId: school.elevenlabsAgentId, phoneNumberId: phoneNum.phone_number_id },
                 });
-                return res.status(500).json({ 
-                    error: `ElevenLabs Linking Failed: ${elError.message}. Please check if the Agent ID is valid in ElevenLabs.` 
+                return res.status(500).json({
+                    error: `Phone linking failed: ${elError.message}. Please check if the Agent ID is valid in ${numberProvider}.`
                 });
             }
         } else {
-            console.warn(`[Assign Phone] Skipping ElevenLabs link: No agent ID configured for school ${school.name}`);
+            console.warn(`[Assign Phone] Skipping voice provider link: No agent ID configured for school ${school.name}`);
         }
 
         // 4. Update PhoneNumber doc mapping
@@ -1159,23 +1169,24 @@ router.post('/schools/:id/agent-prompt', async (req, res) => {
         const nextSystemPrompt = systemPrompt !== undefined ? String(systemPrompt) : String(school.systemPrompt || '');
         const agentId = (school.elevenlabsAgentId || '').trim();
 
+        const provider = getProvider(school.voiceProvider || 'elevenlabs');
         console.log('[Admin Agent Prompt] school.name:', school.name);
+        console.log('[Admin Agent Prompt] school.voiceProvider:', school.voiceProvider || 'elevenlabs');
         console.log('[Admin Agent Prompt] school.elevenlabsAgentId:', agentId || '(empty)');
-        console.log('[Admin Agent Prompt] ELEVENLABS_API_URL:', process.env.ELEVENLABS_API_URL || '(not set)');
         console.log('[Admin Agent Prompt] nextScript preview:', nextScript.slice(0, 120));
         console.log('[Admin Agent Prompt] nextSystemPrompt preview:', nextSystemPrompt.slice(0, 120));
 
         if (!agentId) {
-            return res.status(400).json({ error: 'This school has no ElevenLabs Agent ID configured.' });
+            return res.status(400).json({ error: 'This school has no voice agent ID configured.' });
         }
 
-        const syncResult = await patchAgentPromptContent(agentId, {
+        const syncResult = await provider.patchAgentPromptContent(agentId, {
             firstMessage: nextScript,
             systemPrompt: nextSystemPrompt,
             knowledgeBaseId: school.knowledgeBaseDocumentId || '',
         });
         if (!syncResult) {
-            return res.status(502).json({ error: 'Failed to patch ElevenLabs agent. Check server logs for API error details.' });
+            return res.status(502).json({ error: 'Failed to patch voice agent. Check server logs for API error details.' });
         }
 
         school.script = nextScript;

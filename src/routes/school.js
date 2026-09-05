@@ -46,11 +46,9 @@ const {
     resolveCallerNameWithPastFallback,
 } = require('../services/leadInsightService');
 const {
+    getProvider,
     formatQAPairsForKB,
-    ingestKnowledgeBaseDocument,
-    syncSchoolAgent,
-    APPOINTMENT_AGENT_PROMPT,
-} = require('../utils/elevenlabs');
+} = require('../services/voiceProviders');
 const { getPlanDef } = require('../config/billingPlans');
 const {
     generateWordCloud,
@@ -61,7 +59,6 @@ const {
 } = require('../utils/openai');
 
 
-// APPOINTMENT_AGENT_PROMPT is now imported from ../utils/elevenlabs
 
 
 const router = express.Router();
@@ -72,10 +69,10 @@ router.use(authMiddleware, schoolOnly);
 const WEBHOOK_LIST_PROJECTION = '-raw_payload -audio_base64 -transcript';
 
 /** Required for HTML5 audio seeking — browsers request byte ranges when scrubbing. */
-function sendAudioBufferWithRange(req, res, audioBuffer) {
+function sendAudioBufferWithRange(req, res, audioBuffer, contentType = 'audio/mpeg') {
     const total = audioBuffer.length;
     res.set('Accept-Ranges', 'bytes');
-    res.set('Content-Type', 'audio/mpeg');
+    res.set('Content-Type', contentType);
     res.set('Cache-Control', 'private, max-age=3600');
 
     const range = req.headers.range;
@@ -107,32 +104,16 @@ function sendAudioBufferWithRange(req, res, audioBuffer) {
     return res.send(chunk);
 }
 
-// Helper function to format Q&A pairs is now imported from elevenlabs utility
+// Helper function to format Q&A pairs is now imported from services/voiceProviders
 
-// Helper function to delete a knowledge base document from ElevenLabs
-async function deleteKnowledgeBaseDocument(documentId) {
+// Deletes a knowledge base document via the school's voice provider.
+async function deleteKnowledgeBaseDocument(school, documentId) {
     if (!documentId) return;
-
-    const baseUrl = process.env.ELEVENLABS_API_URL;
-    if (!baseUrl) {
-        console.warn('[KB] ELEVENLABS_API_URL not configured, skipping KB delete');
-        return;
-    }
-
     try {
-        const url = `${baseUrl}/api/v1/knowledge-base/${documentId}`;
-        console.log(`[KB DELETE] Request URL: ${url}`);
-        console.log(`[KB DELETE] Document ID: ${documentId}`);
-
-        const response = await axios.delete(url);
-        console.log(`[KB DELETE] Response Status: ${response.status}`);
-        console.log(`[KB DELETE] Response Data:`, JSON.stringify(response.data, null, 2));
+        await getProvider(school.voiceProvider || 'elevenlabs').deleteKnowledgeBaseDocument(documentId);
         console.log(`[KB] Successfully deleted document ${documentId}`);
     } catch (err) {
-        console.error(`[KB DELETE] Failed to delete document ${documentId}`);
-        console.error(`[KB DELETE] Error Status:`, err.response?.status);
-        console.error(`[KB DELETE] Error Data:`, JSON.stringify(err.response?.data || {}, null, 2));
-        console.error(`[KB DELETE] Error Message:`, err.message);
+        console.error(`[KB DELETE] Failed to delete document ${documentId}:`, err.message);
         // Don't throw - we'll continue to create new document
     }
 }
@@ -169,34 +150,28 @@ async function patchAgentKnowledgeBaseOnly(agentId, documentId) {
     }
 }
 
-// Helper: sync prompt/KB/human-transfer to ElevenLabs (tools are registration-only).
+// Helper: sync prompt/KB/human-transfer to the school's voice provider (tools are registration-only).
 async function updateAgentWithKnowledgeBase(
+    school,
     agentId,
     firstMessage,
     systemPrompt,
     knowledgeBaseId,
     humanTransfer = { enabled: false, condition: '', phoneNumber: '' },
 ) {
-    const baseUrl = process.env.ELEVENLABS_API_URL;
-    if (!baseUrl) {
-        console.warn('[Agent PATCH] ELEVENLABS_API_URL not configured, skipping agent update');
+    if (!agentId) {
+        console.warn('[Agent PATCH] agentId not configured, skipping agent update');
         return null;
     }
 
-    if (!agentId) {
-        console.warn('[Agent PATCH] AGENT_ID not configured, skipping agent update');
-        return null;
-    }
+    const provider = getProvider(school.voiceProvider || 'elevenlabs');
 
     try {
-        const patchStartedAt = new Date().toISOString();
-
         console.log('[Agent PATCH] ========== SYNC START ==========');
-        console.log(`[Agent PATCH] HIT at ${patchStartedAt}`);
-        console.log(`[Agent PATCH] Agent ID: ${agentId}`);
+        console.log(`[Agent PATCH] Agent ID: ${agentId} (${school.voiceProvider || 'elevenlabs'})`);
         console.log('[Agent PATCH] human_transfer enabled:', Boolean(humanTransfer?.enabled));
 
-        const data = await syncSchoolAgent(agentId, {
+        const data = await provider.syncSchoolAgent(agentId, {
             firstMessage,
             systemPrompt,
             knowledgeBaseId,
@@ -205,18 +180,12 @@ async function updateAgentWithKnowledgeBase(
         console.log('[Agent PATCH] ========== SYNC SUCCESS ==========');
         return data;
     } catch (err) {
-        console.error(`[Agent PATCH] FAILED at ${new Date().toISOString()}`);
-        if (err?.response?.status !== 404) {
-            console.error(`[Agent PATCH] Failed to update agent`);
-            console.error(`[Agent PATCH] Error Status:`, err.response?.status);
-            console.error(`[Agent PATCH] Error Data:`, JSON.stringify(err.response?.data || {}, null, 2));
-            console.error(`[Agent PATCH] Error Message:`, err.message);
-        }
+        console.error(`[Agent PATCH] FAILED:`, err.response?.status || err.statusCode, err.message);
         throw err;
     }
 }
 
-// Helper function to ingest knowledge base is now imported from elevenlabs utility
+// Helper function to ingest knowledge base is now imported from services/voiceProviders
 
 // GET /api/school/dashboard - School-specific metrics
 router.get('/dashboard', async (req, res) => {
@@ -292,7 +261,13 @@ router.get('/dashboard', async (req, res) => {
 
         const schoolAiNumber = normalizePhone(school?.aiNumber || '');
         const userToken = req.headers.authorization?.split(' ')[1] || '';
-        const backendUrl = process.env.BACKEND_URL || `${req.protocol}://${req.get('host')}`;
+        // Always the host the browser is already talking to for this request — not
+        // process.env.BACKEND_URL, which is reserved for telling external services
+        // (Cartesia's tool/webhook callbacks) how to reach this backend publicly. Reusing
+        // it here would route the browser's own audio/asset requests through that same
+        // public tunnel (e.g. ngrok in dev), which free-tier ngrok blocks with an HTML
+        // interstitial instead of serving the actual response.
+        const backendUrl = `${req.protocol}://${req.get('host')}`;
 
         const { resolveDashboardPeriod, isWithinPeriod, buildDashboardChartData } = require('../utils/dashboardPeriod');
         const periodWindow = resolveDashboardPeriod(req.query);
@@ -830,7 +805,13 @@ router.get('/recent-calls', async (req, res) => {
         };
 
         const userToken = req.headers.authorization?.split(' ')[1] || '';
-        const backendUrl = process.env.BACKEND_URL || `${req.protocol}://${req.get('host')}`;
+        // Always the host the browser is already talking to for this request — not
+        // process.env.BACKEND_URL, which is reserved for telling external services
+        // (Cartesia's tool/webhook callbacks) how to reach this backend publicly. Reusing
+        // it here would route the browser's own audio/asset requests through that same
+        // public tunnel (e.g. ngrok in dev), which free-tier ngrok blocks with an HTML
+        // interstitial instead of serving the actual response.
+        const backendUrl = `${req.protocol}://${req.get('host')}`;
         const schoolAiNumber = normalizePhone(school?.aiNumber || '');
         const startUnix = Math.floor(periodStart.getTime() / 1000);
         const endUnix = Math.floor(periodEnd.getTime() / 1000);
@@ -1359,7 +1340,13 @@ router.get('/daily-insights', async (req, res) => {
         const normalizePhone = (p) => (p || '').replace(/\D/g, '');
         const schoolAiNumber = normalizePhone(school?.aiNumber || '');
         const userToken = req.headers.authorization?.split(' ')[1] || '';
-        const backendUrl = process.env.BACKEND_URL || `${req.protocol}://${req.get('host')}`;
+        // Always the host the browser is already talking to for this request — not
+        // process.env.BACKEND_URL, which is reserved for telling external services
+        // (Cartesia's tool/webhook callbacks) how to reach this backend publicly. Reusing
+        // it here would route the browser's own audio/asset requests through that same
+        // public tunnel (e.g. ngrok in dev), which free-tier ngrok blocks with an HTML
+        // interstitial instead of serving the actual response.
+        const backendUrl = `${req.protocol}://${req.get('host')}`;
 
         // Today boundaries (UTC)
         const todayStart = new Date();
@@ -1612,6 +1599,7 @@ router.get('/daily-insights', async (req, res) => {
             wordCloud,
             todayCalls,
             hotLeads: actionNeeded.filter((call) => call.isHotLead),
+            warmLeads: actionNeeded.filter((call) => call.leadTemperature === 'warm'),
         });
         console.log(
             `[DailyInsights] school=${schoolId} actionNeeded=${actionNeeded.length} tours=${todaysTours.length} todayCalls=${todayCalls.length} ${Date.now() - startedAt}ms`
@@ -1631,7 +1619,13 @@ router.get('/action-needed', async (req, res) => {
         const normalizePhone = (p) => (p || '').replace(/\D/g, '');
         const schoolAiNumber = normalizePhone(school?.aiNumber || '');
         const userToken = req.headers.authorization?.split(' ')[1] || '';
-        const backendUrl = process.env.BACKEND_URL || `${req.protocol}://${req.get('host')}`;
+        // Always the host the browser is already talking to for this request — not
+        // process.env.BACKEND_URL, which is reserved for telling external services
+        // (Cartesia's tool/webhook callbacks) how to reach this backend publicly. Reusing
+        // it here would route the browser's own audio/asset requests through that same
+        // public tunnel (e.g. ngrok in dev), which free-tier ngrok blocks with an HTML
+        // interstitial instead of serving the actual response.
+        const backendUrl = `${req.protocol}://${req.get('host')}`;
 
         // Get calls from the last 30 days that need action
         const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
@@ -1641,6 +1635,7 @@ router.get('/action-needed', async (req, res) => {
         res.json({
             actionNeeded,
             hotLeads: actionNeeded.filter((call) => call.isHotLead),
+            warmLeads: actionNeeded.filter((call) => call.leadTemperature === 'warm'),
         });
     } catch (err) {
         console.error('Action needed error:', err);
@@ -1834,7 +1829,13 @@ router.get('/call-logs', async (req, res) => {
         const endUnix = Math.floor(periodEnd.getTime() / 1000);
 
         const userToken = req.headers.authorization?.split(' ')[1] || '';
-        const backendUrl = process.env.BACKEND_URL || `${req.protocol}://${req.get('host')}`;
+        // Always the host the browser is already talking to for this request — not
+        // process.env.BACKEND_URL, which is reserved for telling external services
+        // (Cartesia's tool/webhook callbacks) how to reach this backend publicly. Reusing
+        // it here would route the browser's own audio/asset requests through that same
+        // public tunnel (e.g. ngrok in dev), which free-tier ngrok blocks with an HTML
+        // interstitial instead of serving the actual response.
+        const backendUrl = `${req.protocol}://${req.get('host')}`;
 
         const normalizePhone = (phone) => {
             if (!phone) return '';
@@ -2199,26 +2200,20 @@ router.get('/calls/:conversationId/audio', async (req, res) => {
             return sendAudioBufferWithRange(req, res, silentMp3);
         }
 
-        // ── Strategy 3: Fetch Directly from ElevenLabs API (Proxy) ────────
-        const baseUrl = process.env.ELEVENLABS_API_URL;
-        if (baseUrl) {
-            try {
-                console.log(`[Audio Proxy] Requesting: ${conversationId}`);
-                const response = await axios.get(`${baseUrl}/api/v1/conversations/${conversationId}/audio`, {
-                    responseType: 'arraybuffer',
-                    timeout: 10000
-                });
-
-                if (response.status === 200) {
-                    console.log(`[Audio Proxy] Success for: ${conversationId}`);
-                    const audioBuffer = Buffer.from(response.data);
-                    return sendAudioBufferWithRange(req, res, audioBuffer);
-                }
-            } catch (proxyErr) {
-                console.warn(`[Audio Proxy] Failed for ${conversationId}: ${proxyErr.response?.status || proxyErr.message}`);
-                // If it's 404 and we're in dev/test, we could return silence too, 
-                // but let's only do it for test_conv_ prefix for now.
+        // ── Strategy 3: Fetch Directly from the school's voice provider (Proxy) ────────
+        try {
+            const school = await School.findById(schoolObjectId).select('voiceProvider').lean();
+            const provider = getProvider(school?.voiceProvider || 'elevenlabs');
+            console.log(`[Audio Proxy] Requesting: ${conversationId} via ${school?.voiceProvider || 'elevenlabs'}`);
+            const audio = await provider.getConversationAudio(conversationId);
+            if (audio?.buffer) {
+                console.log(`[Audio Proxy] Success for: ${conversationId}`);
+                return sendAudioBufferWithRange(req, res, audio.buffer, audio.contentType);
             }
+        } catch (proxyErr) {
+            console.warn(`[Audio Proxy] Failed for ${conversationId}: ${proxyErr.response?.status || proxyErr.message}`);
+            // If it's 404 and we're in dev/test, we could return silence too,
+            // but let's only do it for test_conv_ prefix for now.
         }
 
         return res.status(404).json({ error: 'Audio recording not found' });
@@ -2515,12 +2510,16 @@ router.put('/settings', async (req, res) => {
             console.log('[PUT /settings] qaPairs set on document:', school.qaPairs.length);
         }
 
-        // Sync with ElevenLabs Knowledge Base if qaPairs changed (DELETE old KB, POST new KB)
+        // Prefer school-specific agent ID when set; fall back to global AGENT_ID
+        const agentId = (school.elevenlabsAgentId && school.elevenlabsAgentId.trim()) || process.env.AGENT_ID || null;
+        const voiceProvider = getProvider(school.voiceProvider || 'elevenlabs');
+
+        // Sync with the voice provider's Knowledge Base if qaPairs changed (DELETE old KB, POST new KB)
         if (qaPairsChanged && Array.isArray(qaPairs)) {
             try {
                 // Step 1: Delete old KB document only if document_id exists and is not empty
                 if (school.knowledgeBaseDocumentId && school.knowledgeBaseDocumentId.trim() !== '') {
-                    await deleteKnowledgeBaseDocument(school.knowledgeBaseDocumentId);
+                    await deleteKnowledgeBaseDocument(school, school.knowledgeBaseDocumentId);
                     school.knowledgeBaseDocumentId = ''; // Clear the document_id
                 }
 
@@ -2529,7 +2528,7 @@ router.put('/settings', async (req, res) => {
                     const kbText = formatQAPairsForKB(school.qaPairs);
                     if (kbText) { // Only create if we have valid text
                         // Pass school name to generate document name on backend
-                        const newDocumentId = await ingestKnowledgeBaseDocument(kbText, school.name);
+                        const newDocumentId = await voiceProvider.ingestKnowledgeBaseDocument(kbText, school.name, { agentId });
 
                         // Step 3: Store the new document_id
                         if (newDocumentId) {
@@ -2546,42 +2545,38 @@ router.put('/settings', async (req, res) => {
 
         // Consolidated Agent Update: If Q&A, first message, or system prompt changed, push FULL payload
         if (qaPairsChanged || humanTransferChanged) {
-            // Prefer school-specific agent ID when set; fall back to global AGENT_ID
-            const agentId = (school.elevenlabsAgentId && school.elevenlabsAgentId.trim()) || process.env.AGENT_ID || null;
             console.log('[PUT /settings] Agent sync inputs:', {
                 schoolId: String(school._id),
                 agentId: agentId || null,
+                voiceProvider: school.voiceProvider || 'elevenlabs',
                 humanTransferEnabled: Boolean(school.enableHumanTransfer),
                 humanTransferCondition: school.humanTransferCondition || '',
                 humanTransferPhoneNumber: school.humanTransferPhoneNumber || ''
             });
             if (agentId) {
-                if (!process.env.ELEVENLABS_API_URL) {
-                    console.warn('[PUT /settings] ELEVENLABS_API_URL not set — skipping agent PATCH');
-                } else {
-                    try {
-                        await updateAgentWithKnowledgeBase(
-                            agentId,
-                            school.script || '',
-                            school.systemPrompt || '',
-                            school.knowledgeBaseDocumentId || '',
-                            {
-                                enabled: Boolean(school.enableHumanTransfer),
-                                condition: school.humanTransferCondition || '',
-                                phoneNumber: school.humanTransferPhoneNumber || ''
-                            },
-                        );
-                        console.log('[PUT /settings] Agent updated with full payload (KB and/or Persona changes)');
-                    } catch (err) {
-                        const status = err?.response?.status;
-                        const detail = err?.response?.data?.detail || err?.message || 'Unknown error';
-                        if (status === 404) {
-                            // Agent no longer exists — clear the stored ID so we don't keep retrying
-                            school.elevenlabsAgentId = '';
-                            console.warn(`[PUT /settings] ElevenLabs agent (${agentId}) not found — clearing stored Agent ID. Please set a valid Agent ID in Settings.`);
-                        } else {
-                            console.error(`[PUT /settings] Failed to update agent: [${status}] ${detail}`);
-                        }
+                try {
+                    await updateAgentWithKnowledgeBase(
+                        school,
+                        agentId,
+                        school.script || '',
+                        school.systemPrompt || '',
+                        school.knowledgeBaseDocumentId || '',
+                        {
+                            enabled: Boolean(school.enableHumanTransfer),
+                            condition: school.humanTransferCondition || '',
+                            phoneNumber: school.humanTransferPhoneNumber || ''
+                        },
+                    );
+                    console.log('[PUT /settings] Agent updated with full payload (KB and/or Persona changes)');
+                } catch (err) {
+                    const status = err?.response?.status || err?.statusCode;
+                    const detail = err?.response?.data?.detail || err?.message || 'Unknown error';
+                    if (status === 404) {
+                        // Agent no longer exists — clear the stored ID so we don't keep retrying
+                        school.elevenlabsAgentId = '';
+                        console.warn(`[PUT /settings] Voice agent (${agentId}) not found — clearing stored Agent ID. Please set a valid Agent ID in Settings.`);
+                    } else {
+                        console.error(`[PUT /settings] Failed to update agent: [${status}] ${detail}`);
                     }
                 }
             } else {

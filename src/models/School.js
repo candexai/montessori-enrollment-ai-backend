@@ -29,7 +29,11 @@ const schoolSchema = new mongoose.Schema({
     address: { type: String, default: '' },
     timezone: { type: String, default: 'America/Chicago' }, // School's local timezone
     adminEmail: { type: String, default: '' }, // Admin email for webhook notifications
-    elevenlabsAgentId: { type: String, default: '' }, // ElevenLabs Agent ID for inbound call identification
+    elevenlabsAgentId: { type: String, default: '' }, // Voice-provider agent ID for inbound call identification (name kept for compat; see voiceProvider)
+    // Which voice provider elevenlabsAgentId/toolIds/agentPhoneNumberId belong to. Set once at agent
+    // creation from the active VOICE_PROVIDER env; existing schools always route through this field,
+    // not the current env value, so flipping VOICE_PROVIDER only affects brand-new schools.
+    voiceProvider: { type: String, enum: ['elevenlabs', 'cartesia'], default: 'elevenlabs' },
     agentPhoneNumberId: { type: String, default: '' }, // Associated SIP trunk number ID
     // Tour confirmation templates
     tourConfirmationEmailTemplate: { type: String, default: 'Dear {parent_name},\n\nYour tour at {school_name} has been scheduled for {tour_date}.\n\nLocation: {school_address}\n\nWe look forward to seeing you!\n\nWarm regards,\n{school_name}' },

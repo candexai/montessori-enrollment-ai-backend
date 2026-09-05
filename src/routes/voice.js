@@ -74,6 +74,41 @@ router.get('/agent-config', async (req, res) => {
     }
 });
 
+// GET /api/voice/current-datetime - No auth. Cartesia get_current_datetime_cst tool: current date/time anchor for the call.
+// Query: schoolId=xxx (optional; falls back to America/Chicago when omitted or not found)
+router.get('/current-datetime', async (req, res) => {
+    try {
+        const { schoolId } = req.query;
+        let timezone = 'America/Chicago';
+        if (schoolId && mongoose.Types.ObjectId.isValid(schoolId)) {
+            const school = await School.findById(schoolId).select('timezone').lean();
+            if (school?.timezone) timezone = school.timezone;
+        }
+
+        const now = new Date();
+        const parts = new Intl.DateTimeFormat('en-US', {
+            timeZone: timezone,
+            year: 'numeric', month: '2-digit', day: '2-digit',
+            hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+            weekday: 'long',
+        }).formatToParts(now).reduce((acc, part) => {
+            acc[part.type] = part.value;
+            return acc;
+        }, {});
+
+        res.json({
+            date: `${parts.year}-${parts.month}-${parts.day}`,
+            time: `${parts.hour}:${parts.minute}:${parts.second}`,
+            day_of_week: parts.weekday,
+            timezone,
+            iso: now.toISOString(),
+        });
+    } catch (err) {
+        console.error('Current datetime error:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 // GET /api/voice/availability - No auth. Agent calls to get free 30-min slots for a day (respects blocked times, no overlaps).
 // Query: schoolId=xxx&date=YYYY-MM-DD
 router.get('/availability', async (req, res) => {

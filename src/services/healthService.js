@@ -1,6 +1,6 @@
 const mongoose = require('mongoose');
-const axios = require('axios');
 const AlertService = require('./alertService');
+const { getProvider } = require('./voiceProviders');
 
 let lastHealthAlerts = {};
 
@@ -61,40 +61,22 @@ function checkOpenAI() {
     return { ok: configured, detail: configured ? 'API key present' : 'OPENAI_API_KEY missing' };
 }
 
-async function checkElevenLabs() {
-    const apiKey = process.env.ELEVENLABS_API_KEY;
-    const baseUrl = (process.env.ELEVENLABS_API_URL || 'https://api.elevenlabs.io').replace(/\/$/, '');
-    if (!apiKey) {
-        return { ok: false, detail: 'ELEVENLABS_API_KEY missing' };
-    }
-    try {
-        const start = Date.now();
-        await axios.get(`${baseUrl}/v1/user`, {
-            headers: { 'xi-api-key': apiKey },
-            timeout: 8000,
-        });
-        return { ok: true, latencyMs: Date.now() - start };
-    } catch (err) {
-        const status = err.response?.status;
-        return {
-            ok: false,
-            detail: status ? `HTTP ${status}` : err.message,
-            latencyMs: undefined,
-        };
-    }
-}
-
 async function runHealthChecks() {
-    const [database, elevenlabs] = await Promise.all([
+    // Cartesia is only checked when configured — most deployments today run ElevenLabs-only,
+    // and an unconfigured Cartesia shouldn't report as a degraded system.
+    const cartesiaConfigured = Boolean(process.env.CARTESIA_API_URL);
+
+    const [database, elevenlabs, cartesia] = await Promise.all([
         checkDatabase(),
-        checkElevenLabs(),
+        getProvider('elevenlabs').checkHealth(),
+        cartesiaConfigured ? getProvider('cartesia').checkHealth() : Promise.resolve(null),
     ]);
 
     const outlook = checkOutlook();
     const openai = checkOpenAI();
     const email = checkEmail();
 
-    const checks = { database, outlook, elevenlabs, openai, email };
+    const checks = { database, outlook, elevenlabs, openai, email, ...(cartesia ? { cartesia } : {}) };
 
     if (!database.ok) {
         healthAlert('database', 'CRITICAL', database.detail || 'Database unreachable');
@@ -104,6 +86,9 @@ async function runHealthChecks() {
     }
     if (!elevenlabs.ok) {
         healthAlert('elevenlabs', 'WARNING', elevenlabs.detail || 'ElevenLabs check failed');
+    }
+    if (cartesia && !cartesia.ok) {
+        healthAlert('cartesia', 'WARNING', cartesia.detail || 'Cartesia check failed');
     }
     if (!openai.ok) {
         healthAlert('openai', 'WARNING', openai.detail);

@@ -16,6 +16,7 @@ const { parseLocalDateTimeToUTC } = require('../utils/timezone');
 const { deductCallMinutes } = require('../services/billingService');
 const { mapComprehensiveResult, upsertLeadInsight, resolveParentEmail, isTourBookedEmailMissing } = require('../services/leadInsightService');
 const { detectElevenLabsCallFailure } = require('../utils/elevenLabsCallFailure');
+const { getProvider } = require('../services/voiceProviders');
 const jwt = require('jsonwebtoken');
 const JWT_SECRET = process.env.JWT_SECRET || 'childcare-enrollment-ai-secret-key-2024';
 
@@ -43,20 +44,25 @@ function reportElevenLabsCallFailureAlert({
             || phoneMeta.from_number
             || data?.user_id
             || '';
+        const providerLabel = metadata?.provider || 'elevenlabs';
 
         console.error(
             `[Webhook] Live call failure detected conversation=${conversationId}`
             + ` quota=${failure.isQuota} reason=${failure.terminationReason || failure.errorText || failure.message}`
         );
 
+        const alertType = providerLabel === 'cartesia' && failure.alertType === 'ELEVENLABS_ERROR'
+            ? 'CARTESIA_ERROR'
+            : failure.alertType;
+
         const AlertService = require('../services/alertService');
         AlertService.create({
-            type: failure.alertType,
+            type: alertType,
             severity: failure.severity,
             schoolId: schoolId || null,
             title: failure.title,
             message: failure.message,
-            source: 'webhook.elevenlabs.post_call_transcription',
+            source: `webhook.${providerLabel}.post_call_transcription`,
             metadata: {
                 conversationId,
                 agentId,
@@ -102,6 +108,37 @@ router.post('/elevenlabs', async (req, res) => {
             metadata: { stack: err.stack },
         });
     });
+});
+
+/**
+ * POST /api/v1/webhook/cartesia
+ * Webhook endpoint to receive call events from Cartesia. No authentication required
+ * (matches the existing ElevenLabs webhook's posture — see reference implementation notes).
+ * Cartesia's payload shape is normalized into the same { type, data } envelope ElevenLabs
+ * sends, then handed to the same processWebhookAsync used above — school matching, billing,
+ * and alerting need no provider branching once normalized.
+ */
+router.post('/cartesia', async (req, res) => {
+    const rawPayload = req.body || {};
+    console.log('[Webhook] Received Cartesia POST type=', rawPayload?.type || 'unknown', 'call_id=', rawPayload?.call_id || rawPayload?.data?.call_id || 'n/a');
+
+    res.status(200).json({ status: 'received', message: 'Webhook received successfully' });
+
+    try {
+        const normalized = getProvider('cartesia').normalizeCartesiaWebhookPayload(rawPayload);
+        await processWebhookAsync(normalized);
+    } catch (err) {
+        console.error('[Webhook] Cartesia async processing error:', err);
+        const AlertService = require('../services/alertService');
+        AlertService.create({
+            type: 'WEBHOOK_ERROR',
+            severity: 'CRITICAL',
+            title: 'Cartesia webhook processing failed',
+            message: err.message,
+            source: 'webhook.cartesia.processWebhookAsync',
+            metadata: { stack: err.stack },
+        });
+    }
 });
 
 /**

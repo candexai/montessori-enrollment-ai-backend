@@ -19,7 +19,7 @@ const {
     linkAgentToolIds,
     getBookedSlotsToolIds,
     GLOBAL_TIME_TOOL_ID,
-} = require('../src/utils/elevenlabs');
+} = require('../src/services/voiceProviders/elevenlabs');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 

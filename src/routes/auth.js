@@ -7,16 +7,11 @@ const School = require('../models/School');
 const Integration = require('../models/Integration');
 const { authMiddleware } = require('../middleware/auth');
 const {
-    createSchoolAgent,
-    registerTool,
-    linkAgentToolIds,
-    GLOBAL_TIME_TOOL_ID,
-    formatQAPairsForKB,
-    ingestKnowledgeBaseDocument,
     NORA_SYSTEM_PROMPT_TEMPLATE,
     DEFAULT_FIRST_MESSAGE_TEMPLATE,
     HUMAN_TRANSFER_TOOL_CONDITION,
-} = require('../utils/elevenlabs');
+} = require('../services/voiceProviders');
+const { provisionSchoolVoiceAgent } = require('../services/schoolAgentProvisioning');
 const AlertService = require('../services/alertService');
 
 const router = express.Router();
@@ -144,60 +139,9 @@ router.post('/register', async (req, res) => {
             humanTransferCondition: HUMAN_TRANSFER_TOOL_CONDITION,
         });
 
-        // 2b. Generate Knowledge Base for the school (if any qaPairs exist)
-        let knowledgeBaseId = null;
-        if (school.qaPairs && school.qaPairs.length > 0) {
-            const kbText = formatQAPairsForKB(school.qaPairs);
-            if (kbText) {
-                knowledgeBaseId = await ingestKnowledgeBaseDocument(kbText, schoolName);
-                if (knowledgeBaseId) {
-                    school.knowledgeBaseDocumentId = knowledgeBaseId;
-                    await school.save();
-                }
-            }
-        }
-
-        // 2c. Create ElevenLabs Agent for the school
-        const agentId = await createSchoolAgent(schoolName, school.knowledgeBaseDocumentId);
-        if (agentId) {
-            school.elevenlabsAgentId = agentId;
-
-            // Register booked-slots tool
-            const toolId = await registerTool(school._id.toString(), agentId);
-            if (toolId) {
-                school.toolIds = [toolId, GLOBAL_TIME_TOOL_ID];
-                const linked = await linkAgentToolIds(agentId, school.toolIds);
-                if (linked) {
-                    console.log(`[Register] Tools linked to agent ${agentId}:`, school.toolIds);
-                } else {
-                    console.warn(
-                        `[Register] Stored tool IDs ${school.toolIds.join(', ')} but ElevenLabs link failed for ${agentId}. `
-                        + 'Restart the backend if you still see [Agent Patch Prompt] logs (old code).'
-                    );
-                    AlertService.create({
-                        type: 'AGENT_ERROR',
-                        severity: 'WARNING',
-                        schoolId: school._id,
-                        schoolName,
-                        title: 'ElevenLabs tool linking failed during signup',
-                        message: `linkAgentToolIds failed for agent ${agentId}`,
-                        source: 'auth.register',
-                    });
-                }
-            }
-
-            await school.save();
-        } else {
-            AlertService.create({
-                type: 'AGENT_ERROR',
-                severity: 'CRITICAL',
-                schoolId: school._id,
-                schoolName,
-                title: 'School registered without voice agent',
-                message: 'createSchoolAgent returned null during registration',
-                source: 'auth.register',
-            });
-        }
+        // 2b. Create the voice agent (KB ingest + agent create + tool registration) on the active provider
+        await provisionSchoolVoiceAgent(school, { source: 'auth.register' });
+        await school.save();
 
         // 3. Create the user
         const hashedPassword = bcrypt.hashSync(password, 10);
@@ -423,43 +367,9 @@ router.post('/google/callback', async (req, res) => {
                 humanTransferCondition: HUMAN_TRANSFER_TOOL_CONDITION,
             });
 
-            // Generate Knowledge Base
-            let knowledgeBaseId = null;
-            if (school.qaPairs && school.qaPairs.length > 0) {
-                const kbText = formatQAPairsForKB(school.qaPairs);
-                if (kbText) {
-                    knowledgeBaseId = await ingestKnowledgeBaseDocument(kbText, schoolName);
-                    if (knowledgeBaseId) {
-                        school.knowledgeBaseDocumentId = knowledgeBaseId;
-                        await school.save();
-                    }
-                }
-            }
-
-            // Create ElevenLabs Agent for the school
-            const agentId = await createSchoolAgent(schoolName, school.knowledgeBaseDocumentId);
-            if (agentId) {
-                school.elevenlabsAgentId = agentId;
-
-                // Register booked-slots tool
-                const toolId = await registerTool(school._id.toString(), agentId);
-                if (toolId) {
-                    school.toolIds = [toolId, GLOBAL_TIME_TOOL_ID];
-                    await linkAgentToolIds(agentId, school.toolIds);
-                }
-
-                await school.save();
-            } else {
-                AlertService.create({
-                    type: 'AGENT_ERROR',
-                    severity: 'CRITICAL',
-                    schoolId: school._id,
-                    schoolName,
-                    title: 'Google signup without voice agent',
-                    message: 'createSchoolAgent returned null',
-                    source: 'auth.google.callback',
-                });
-            }
+            // Create the voice agent (KB ingest + agent create + tool registration) on the active provider
+            await provisionSchoolVoiceAgent(school, { source: 'auth.google.callback' });
+            await school.save();
 
             // Create user with Google OAuth
             user = await User.create({
@@ -552,43 +462,9 @@ router.post('/google/complete-signup', async (req, res) => {
             humanTransferCondition: HUMAN_TRANSFER_TOOL_CONDITION,
         });
 
-        // Generate Knowledge Base
-        let knowledgeBaseId = null;
-        if (school.qaPairs && school.qaPairs.length > 0) {
-            const kbText = formatQAPairsForKB(school.qaPairs);
-            if (kbText) {
-                knowledgeBaseId = await ingestKnowledgeBaseDocument(kbText, schoolName);
-                if (knowledgeBaseId) {
-                    school.knowledgeBaseDocumentId = knowledgeBaseId;
-                    await school.save();
-                }
-            }
-        }
-
-        // Create ElevenLabs Agent for the school
-        const agentId = await createSchoolAgent(schoolName, school.knowledgeBaseDocumentId);
-        if (agentId) {
-            school.elevenlabsAgentId = agentId;
-
-            // Register booked-slots tool
-            const toolId = await registerTool(school._id.toString(), agentId);
-            if (toolId) {
-                school.toolIds = [toolId, GLOBAL_TIME_TOOL_ID];
-                await linkAgentToolIds(agentId, school.toolIds);
-            }
-
-            await school.save();
-        } else {
-            AlertService.create({
-                type: 'AGENT_ERROR',
-                severity: 'CRITICAL',
-                schoolId: school._id,
-                schoolName,
-                title: 'Google complete-signup without voice agent',
-                message: 'createSchoolAgent returned null',
-                source: 'auth.google.complete-signup',
-            });
-        }
+        // Create the voice agent (KB ingest + agent create + tool registration) on the active provider
+        await provisionSchoolVoiceAgent(school, { source: 'auth.google.complete-signup' });
+        await school.save();
 
         // Create user
         const user = await User.create({

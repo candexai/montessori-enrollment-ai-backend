@@ -9,17 +9,12 @@ const ReferralLink = require('../models/ReferralLink');
 const Referral = require('../models/Referral');
 const TourBooking = require('../models/TourBooking');
 const { createCalendarEvent, getFreeSlots, isSlotAvailable } = require('../services/calendarService');
-const { 
-    createSchoolAgent,
-    registerTool,
-    linkAgentToolIds,
-    GLOBAL_TIME_TOOL_ID,
-    formatQAPairsForKB,
-    ingestKnowledgeBaseDocument,
+const {
     NORA_SYSTEM_PROMPT_TEMPLATE,
     DEFAULT_FIRST_MESSAGE_TEMPLATE,
     HUMAN_TRANSFER_TOOL_CONDITION,
-} = require('../utils/elevenlabs');
+} = require('../services/voiceProviders');
+const { provisionSchoolVoiceAgent } = require('../services/schoolAgentProvisioning');
 
 const router = express.Router();
 
@@ -282,59 +277,9 @@ router.post('/refer/:code/register', async (req, res) => {
             humanTransferCondition: HUMAN_TRANSFER_TOOL_CONDITION,
         });
 
-        // Generate Knowledge Base for the school (if any qaPairs exist)
-        let knowledgeBaseId = null;
-        if (school.qaPairs && school.qaPairs.length > 0) {
-            const kbText = formatQAPairsForKB(school.qaPairs);
-            if (kbText) {
-                knowledgeBaseId = await ingestKnowledgeBaseDocument(kbText, schoolName.trim());
-                if (knowledgeBaseId) {
-                    school.knowledgeBaseDocumentId = knowledgeBaseId;
-                    await school.save();
-                }
-            }
-        }
-
-        // Create ElevenLabs Agent for the school
-        const agentId = await createSchoolAgent(schoolName.trim(), school.knowledgeBaseDocumentId);
-        if (agentId) {
-            school.elevenlabsAgentId = agentId;
-
-            // Register booked-slots tool
-            const toolId = await registerTool(school._id.toString(), agentId);
-            if (toolId) {
-                school.toolIds = [toolId, GLOBAL_TIME_TOOL_ID];
-                const linked = await linkAgentToolIds(agentId, school.toolIds);
-                if (linked) {
-                    console.log(`[Referral Register] Tools linked to agent ${agentId}:`, school.toolIds);
-                } else {
-                    console.warn(`[Referral Register] tool_ids link failed for ${agentId}; IDs saved in DB:`, school.toolIds);
-                    const AlertService = require('../services/alertService');
-                    AlertService.create({
-                        type: 'AGENT_ERROR',
-                        severity: 'WARNING',
-                        schoolId: school._id,
-                        schoolName: schoolName.trim(),
-                        title: 'Referral signup: tool linking failed',
-                        message: `linkAgentToolIds failed for agent ${agentId}`,
-                        source: 'public.refer.register',
-                    });
-                }
-            }
-
-            await school.save();
-        } else {
-            const AlertService = require('../services/alertService');
-            AlertService.create({
-                type: 'AGENT_ERROR',
-                severity: 'CRITICAL',
-                schoolId: school._id,
-                schoolName: schoolName.trim(),
-                title: 'Referral signup without voice agent',
-                message: 'createSchoolAgent returned null',
-                source: 'public.refer.register',
-            });
-        }
+        // Create the voice agent (KB ingest + agent create + tool registration) on the active provider
+        await provisionSchoolVoiceAgent(school, { source: 'public.refer.register' });
+        await school.save();
 
         const passwordHash = bcrypt.hashSync(password, 10);
         await User.create({

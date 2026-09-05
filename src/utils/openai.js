@@ -167,19 +167,19 @@ function dedupeCaseInsensitive(items) {
 
 /** School/KB topics parents may ask about — not tour scheduling or booking logistics. */
 const SCHOOL_KB_PATTERNS = [
-    /\b(?:tuition|price|cost|fee|afford|billing|payment)\b|financial aid/i,
-    /\b(?:hours|schedule|scheduling|pickup|drop[\s-]?off|holiday|closure)\b|\b(?:open|close)\b/i,
+    /\b(?:tuition|price|cost|fee|afford\w*|billing|payment)\b|financial aid/i,
+    /\b(?:hours|schedule|scheduling|pickup|drop[\s-]?off|holiday|closure)\b|\bopen\b(?!\s*house)|\bclos\w*/i,
     /\b(?:meal|food|lunch|snack|allerg\w*|nutrition|diet)\b/i,
     /\b(?:ratio|teacher|staff|classroom|credential)\b|certif/i,
     /\b(?:curriculum|program|montessori|reggio|learning|development)\b|play[\s-]?based/i,
     /\b(?:camera|security|safety|lock|visitor)\b/i,
     /\b(?:nap|sleep|rest time)\b/i,
-    /\b(?:bus|transport)\b/i,
+    /\bbus(?:es)?\b|\btransport\w*/i,
     /after[\s-]?school|summer camp|extended care/i,
     /\b(?:waitlist|availability|spots?|opening|capacity)\b/i,
     /\b(?:infant|toddler|preschool|kindergarten)\b|pre[\s-]?k|age group/i,
     /\b(?:potty|toilet|diaper)\b/i,
-    /\b(?:vaccin|immuniz|health|sick|illness)\b/i,
+    /\bvaccin\w*|\bimmuniz\w*|\bhealth\b|\bsick\b|\billness\b/i,
     /\b(?:discipline|behavior)\b/i,
     /\b(?:outdoor|playground|gym)\b/i,
 ];

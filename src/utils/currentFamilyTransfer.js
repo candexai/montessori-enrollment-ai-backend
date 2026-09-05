@@ -36,9 +36,17 @@ const CALLER_CURRENT_FAMILY_PATTERNS = [
     /\balready enrolled\b/i,
     /\bexisting (?:family|parent)\b/i,
     /\balready go(?:es)? (?:there|here)\b/i,
+    /\bcurrent (?:parent|student)\b/i,
+    /\breturning family\b/i,
+    /\bexisting (?:student|customer|client)\b/i,
+    /\bmy (?:child|kid|son|daughter|kids|children)(?:'s)? (?:is|are)? ?already (?:enrolled|attend(?:ing|s)?|a student)\b/i,
+    /\b(?:i(?:'m| am)|we(?:'re| are)) (?:already )?(?:a )?(?:current|existing) (?:client|customer|family)\b/i,
     // Spanish: existing / already-enrolled family
     /\bfamilia actual\b/i,
+    /\bfamilia existente\b/i,
     /\bfamilia inscrita\b/i,
+    /\bestudiante actual\b/i,
+    /\bmatriculad[oa]s?\b/i,
     /\b(?:ya\s+)?(?:est[aá]\s+)?inscrit[oa]s?\b/i,
     /^front desk\??\s*$/i,
     /\btransfer to\b/i,
@@ -51,6 +59,8 @@ const CALLER_NEW_FAMILY_PATTERNS = [
     /^familia nueva\.?\s*$/i,
     /\b(?:i(?:'m| am)|we(?:'re| are))(?: a)? new family\b/i,
     /\bnew family\b/i,
+    /\b(?:i(?:'m| am)|we(?:'re| are))(?: a)? new parent\b/i,
+    /\bnew parent\b/i,
     /\bfamilia nueva\b/i,
     /\b(?:i(?:'m| am)|we(?:'re| are)) calling as a new family\b/i,
     /\bprospective (?:family|parent)\b/i,
@@ -188,6 +198,17 @@ function callerWantsHumanRoutingOnly(callerText) {
     if (callerIdentifiedAsCurrentFamily(haystack)) return true;
     if (NON_PARENT_CALLER_PATTERNS.some((pattern) => pattern.test(haystack))) return false;
     return CALLER_HUMAN_ROUTING_PATTERNS.some((pattern) => pattern.test(haystack));
+}
+
+/** Caller explicitly self-identified as a non-parent (teacher/vendor/employee/wrong number). */
+function callerIsNonParent(callerText) {
+    const haystack = String(callerText || '').trim();
+    if (!haystack) return false;
+    return NON_PARENT_CALLER_PATTERNS.some((pattern) => pattern.test(haystack));
+}
+
+function callerIsNonParentFromTranscript(transcriptArray) {
+    return callerIsNonParent(getCallerUtterances(transcriptArray).join('\n'));
 }
 
 function callerIdentifiedAsNewFamilyFromTranscript(transcriptArray) {
@@ -425,6 +446,8 @@ module.exports = {
     callerWantsHumanRoutingOnly,
     callerIdentifiedAsNewFamilyFromTranscript,
     callerWantsHumanRoutingOnlyFromTranscript,
+    callerIsNonParent,
+    callerIsNonParentFromTranscript,
     isCurrentFamilyTransferCall,
     isCurrentFamilyCall,
     agentConfirmedCurrentFamily,

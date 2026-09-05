@@ -13,6 +13,12 @@ const leadInsightSchema = new mongoose.Schema({
     missingDetails: { type: [String], default: [] },
     questionsAsked: { type: [String], default: [] },
     isHotLead: { type: Boolean, default: false, index: true },
+    leadTemperature: {
+        type: String,
+        enum: ['hot', 'warm', 'cold'],
+        default: 'cold',
+        index: true,
+    },
     parentSegment: {
         type: String,
         enum: ['new_parent', 'current_family', 'unknown'],
@@ -33,6 +39,7 @@ const leadInsightSchema = new mongoose.Schema({
 
 leadInsightSchema.index({ schoolId: 1, webhookId: 1 }, { unique: true });
 leadInsightSchema.index({ schoolId: 1, isHotLead: 1, processedAt: -1 });
+leadInsightSchema.index({ schoolId: 1, leadTemperature: 1, processedAt: -1 });
 leadInsightSchema.index({ schoolId: 1, actionNeededEligible: 1, callTimestamp: -1 });
 
 module.exports = mongoose.model('LeadInsight', leadInsightSchema);
